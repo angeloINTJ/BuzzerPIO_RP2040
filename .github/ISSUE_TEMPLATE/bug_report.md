@@ -11,7 +11,6 @@ A clear description of what the problem is.
 
 ## To reproduce
 Minimal sketch that reproduces the issue:
-
 ```cpp
 #include <BuzzerPIO_RP2040.h>
 // ...
