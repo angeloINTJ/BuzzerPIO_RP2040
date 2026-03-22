@@ -5,20 +5,20 @@
  * Demonstrates:
  *   - Continuous tone (manual stop)
  *   - Timed tone (auto-stop after duration)
- *   - Volume control
+ *   - Volume control (ultrasonic PWM amplitude)
  *   - noTone() for silence
  *
  * Wiring:
  *   - Passive buzzer between GP22 and GND
  *   - (Optional) 100Ω series resistor for current limiting
  *
- * @note All tone calls are non-blocking. The loop() runs freely
- *       while the PIO hardware generates the square wave.
+ * @note All tone calls are non-blocking. The dual PIO state machines
+ *       (ultrasonic PWM + tone gate) run autonomously in hardware.
  */
 
 #include <BuzzerPIO_RP2040.h>
 
-// Create a buzzer on GPIO 22 using PIO block 0
+// Create a buzzer on GPIO 22 (auto-probes pio0/pio1 for 4 free slots + 2 SMs)
 BuzzerPIO buzzer(22, pio0);
 
 void setup() {
@@ -28,14 +28,16 @@ void setup() {
     Serial.println("BuzzerPIO_RP2040 — BasicTone Example");
     Serial.println("=====================================\n");
 
-    // Initialize PIO resources
+    // Initialize PIO resources (needs 4 instruction slots + 2 SMs)
     if (!buzzer.begin()) {
         Serial.println("ERROR: Failed to initialize PIO!");
-        Serial.println("Check if the PIO block has a free state machine.");
+        Serial.println("Need 4 free instruction slots + 2 state machines.");
         while (true) delay(1000);
     }
 
-    Serial.println("PIO initialized successfully.\n");
+    Serial.print("PIO initialized on pio");
+    Serial.println((buzzer.getActivePio() == pio0) ? '0' : '1');
+    Serial.println();
 
     // ── Example 1: Continuous tone ─────────────────────────────────
     Serial.println("1. Continuous 1 kHz tone for 1 second...");
@@ -80,5 +82,5 @@ void setup() {
 
 void loop() {
     // Nothing to do here.
-    // The PIO generates tones in hardware, no polling needed.
+    // The dual PIO state machines generate tones in hardware, no polling needed.
 }

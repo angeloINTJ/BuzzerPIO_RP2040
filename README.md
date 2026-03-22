@@ -1,40 +1,55 @@
 # BuzzerPIO_RP2040
 
-Zero-jitter tone generation for passive buzzers using the RP2040 PIO coprocessor.
+Ultrasonic PWM tone generation for passive buzzers using the RP2040 PIO coprocessor.
 
 ## Why this library?
 
 The standard Arduino `tone()` function on the RP2040 has several problems:
 
-| Problem | `tone()` / PWM | **BuzzerPIO** |
-|---------|---------------|---------------|
+| Problem | `tone()` / PWM | **BuzzerPIO v2.1** |
+|---|---|---|
 | Timing jitter | 50–200 ms when loop is busy | **< 10 µs** (hardware alarm) |
 | Blocking | Some implementations block | **100% non-blocking** |
 | PWM conflicts | Uses PWM slices shared with servos/LEDs | **Uses PIO** (independent) |
-| Volume control | Not supported | **64 levels** via duty cycle |
+| Volume control | Not supported | **32 levels** via ultrasonic PWM duty cycle |
 | Melody playback | Requires polling in loop() | **Hardware alarm chain** |
 | CPU usage during tone | Periodic ISR or busy-wait | **Zero** (PIO runs alone) |
+| Volume distortion | N/A | **None** (ultrasonic carrier, not audible-freq duty) |
 
-## How it works
+## How it works — Dual-SM AND gate
 
 ```
-┌─────────┐    setFreq()     ┌─────────────┐    square wave    ┌─────────┐
-│  Your   │ ──────────────→  │  PIO State  │ ──────────────→  │ Passive │
-│  Code   │    setVolume()   │  Machine    │    GPIO pin      │ Buzzer  │
-│         │                  │ (4 instrs)  │                  │         │
-│         │  playMelody()    ├─────────────┤                  └─────────┘
-│         │ ──────────────→  │  Hardware   │
-│         │                  │  Alarm Chain│
-│         │    (returns      │  (IRQ ctx)  │
-│         │   immediately)   └─────────────┘
-└─────────┘                   Runs autonomously
+          SM1 (ultrasonic PWM)              SM2 (tone gate)
+          ┌─────────────────┐              ┌─────────────────┐
+          │ set pins,1 [dH] │              │ set pindirs,1[31]│
+clkdiv=40 │ set pins,0 [dL] │  clkdiv=var  │ set pindirs,0[31]│
+  ~95 kHz │ (wraps [0..1])  │  =tone freq  │ (wraps [2..3])  │
+          └────────┬────────┘              └────────┬────────┘
+                   │ VALUE                          │ OE
+                   │                                │
+          PIO combines: value = SM1_val, OE = SM2_oe
+                   │                                │
+                   └──────── GPIO pin ──────────────┘
+                             │
+                        pull-down R
+                             │
+                            GND
+
+OE=1 → pin outputs SM1 PWM (buzzer hears ultrasonic carrier)
+OE=0 → pin hi-Z → pulled LOW (silence)
+
+Result: output = SM1_pwm AND SM2_gate
 ```
 
-1. **PIO program** (4 instructions in a wrap-loop) generates a continuous square wave. Frequency is controlled by the PIO clock divider; volume by patching the instruction delays to adjust the duty cycle.
+1. **SM1 (PWM carrier)** — 2 instructions wrapping `[0..1]`. Generates a ~95 kHz ultrasonic PWM square wave via `set pins`. The duty cycle controls the equivalent amplitude (volume). The buzzer's mechanical inertia low-pass filters the carrier, so only the duty-cycle envelope is perceived as loudness.
 
-2. **Hardware alarm chain** sequences melody notes in IRQ context. Each alarm callback configures the PIO for the next note and re-schedules itself for that note's duration. Timing precision is limited only by the RP2040 hardware timer (< 10 µs).
+2. **SM2 (tone gate)** — 2 instructions wrapping `[2..3]`. Square wave at the audible frequency via `set pindirs` (output enable). When the gate is open (OE=1), the buzzer hears SM1's PWM. When closed (OE=0), the GPIO pull-down holds the pin LOW.
 
-3. **Your code** calls `tone()` or `playMelody()` and continues immediately. No `update()`, no polling, no `delay()`.
+3. **AND gate via hardware** — SM1 controls the pin VALUE but never touches OE. SM2 controls OE but never touches VALUE. The RP2040 PIO ORs per-SM outputs within a block: `final_value = SM1_val`, `final_OE = SM2_oe`. With the GPIO pull-down, the result is `output = SM1_pwm AND SM2_gate`.
+
+4. **Volume** — Patching SM1's instruction delays changes the PWM duty cycle from 3% (barely audible) to 97% (maximum). The carrier frequency stays constant at ~95 kHz regardless of volume — no harmonic distortion, no frequency shift.
+
+5. **Melody sequencing** — Hardware alarm chain (same proven mechanism as v1.0). Each note transition sets SM2's clock divider for the new frequency. All note transitions happen with < 10 µs jitter, completely independent of the main loop.
 
 ## Installation
 
@@ -62,7 +77,7 @@ Search for **BuzzerPIO_RP2040** in the Library Manager (Tools → Manage Librari
 ```cpp
 #include <BuzzerPIO_RP2040.h>
 
-BuzzerPIO buzzer(22);  // GPIO 22, uses pio0 by default
+BuzzerPIO buzzer(22);  // GPIO 22, auto-probes pio0 then pio1
 
 void setup() {
     buzzer.begin();
@@ -71,7 +86,7 @@ void setup() {
 }
 
 void loop() {
-    // CPU is free — PIO handles the tone
+    // CPU is free — dual PIO state machines handle everything
 }
 ```
 
@@ -84,18 +99,19 @@ BuzzerPIO(uint8_t pin, PIO pio = pio0);
 ```
 
 | Parameter | Description |
-|-----------|-------------|
+|---|---|
 | `pin` | GPIO number (0–28) connected to the passive buzzer |
-| `pio` | PIO block to use: `pio0` (default) or `pio1` |
+| `pio` | Preferred PIO block: `pio0` (default) or `pio1`. If unavailable, `begin()` automatically tries the other block. |
 
-**Choosing a PIO block:** Each RP2040 has 2 PIO blocks with 4 state machines each. If `pio0` is occupied by other PIO libraries (NeoPixel, I2S, etc.), use `pio1`.
+**PIO auto-probe:** The library needs 4 instruction slots + 2 state machines in the **same** PIO block (the AND gate requires per-block OR of SM outputs). If the preferred block doesn't have enough resources, `begin()` transparently falls back to the other.
 
 ### Lifecycle
 
 ```cpp
-bool begin();   // Initialize PIO. Returns false if no SM available.
-void end();     // Release all resources. Called automatically by destructor.
-bool isReady(); // Check if begin() succeeded.
+bool begin();        // Initialize dual-SM PIO. Returns false if resources unavailable.
+void end();          // Release all resources. Called automatically by destructor.
+bool isReady();      // Check if begin() succeeded.
+PIO getActivePio();  // Returns which PIO block was actually allocated.
 ```
 
 ### Tone
@@ -108,7 +124,7 @@ void noTone();                                 // Silence immediately
 
 All calls are **non-blocking**. A timed tone uses a hardware alarm for auto-shutoff — no CPU involvement.
 
-**Frequency range:** 15 Hz – 976 kHz (at 125 MHz sys_clk). Audible sweet spot: 200 Hz – 8 kHz.
+**Frequency range:** 15 Hz – 976 kHz. Audible sweet spot: 200 Hz – 8 kHz.
 
 ### Volume
 
@@ -117,14 +133,16 @@ void setVolume(uint8_t volume);  // 0 (silent) to 100 (max)
 uint8_t getVolume();
 ```
 
-Volume is implemented by adjusting the duty cycle of the square wave via PIO instruction patching. Can be changed while a tone is playing — takes effect immediately.
+Volume controls the ultrasonic PWM duty cycle. Can be changed while a tone is playing — takes effect immediately via PIO instruction patching.
 
-| Volume | Duty cycle | Effect |
-|--------|-----------|--------|
-| 100% | 50% | Maximum amplitude |
-| 50% | ~25% | Moderate |
-| 10% | ~5% | Quiet |
-| 0% | 0% | Silent (SM disabled) |
+| Volume | PWM duty | Carrier frequency | Effect |
+|---|---|---|---|
+| 100% | 97% | ~95 kHz | Maximum amplitude |
+| 50% | 48% | ~95 kHz | Moderate |
+| 10% | 9% | ~95 kHz | Quiet |
+| 0% | — | — | Silent (gate disabled) |
+
+The carrier frequency is **constant** regardless of volume — no harmonic distortion.
 
 ### Melody playback
 
@@ -170,38 +188,83 @@ buzzer.playMelody(myMelody, 4);
 
 **Passive buzzer only.** Active buzzers have a built-in oscillator and produce a fixed tone regardless of the input frequency — they won't work with this library.
 
+> The library enables the internal GPIO pull-down automatically. No external pull-down resistor is needed.
+
+## Advanced configuration
+
+Override this define **before** including the library header, or via build flags:
+
+```cpp
+// Higher carrier frequency (~190 kHz) — less audible on some buzzers
+#define BUZZER_PWM_CLKDIV 20
+
+#include <BuzzerPIO_RP2040.h>
+```
+
+| Define | Default | Description |
+|---|---|---|
+| `BUZZER_PWM_CLKDIV` | 40 | SM1 clock divider. Carrier ≈ 125 MHz / (CLKDIV × 33) |
+
 ## Resource usage
 
 | Resource | Usage |
-|----------|-------|
-| PIO state machines | 1 (auto-claimed) |
+|---|---|
+| PIO state machines | 2 (auto-claimed, same block) |
 | PIO instruction memory | 4 slots (of 32 per block) |
+| DMA channels | 0 |
+| IRQ handlers | 0 |
 | Hardware alarms | 1 (from Pico SDK alarm pool) |
 | RAM | ~40 bytes per instance |
 | Flash | ~2 KB (code) |
 | CPU | 0% during tone/melody (only on API calls) |
 
+## Coexistence with other PIO libraries
+
+The dual-SM architecture was specifically designed to fit alongside other PIO-intensive libraries on the Pico W:
+
+| PIO block | Library | Instructions | SMs |
+|---|---|---|---|
+| pio0 | OneWirePIO_RP2040 (DS18B20) | 27/32 | 1/4 |
+| pio0 | **BuzzerPIO** (if auto-probed here) | 4/32 | 2/4 |
+| pio1 | CYW43 WiFi SPI (Pico W) | ~10/32 | 1/4 |
+| pio1 | DHT22PIO_RP2040 | 17/32 | 1/4 |
+| pio1 | **BuzzerPIO** (if auto-probed here) | 4/32 | 2/4 |
+
+Both blocks have room for BuzzerPIO (4 instructions + 2 SMs). The auto-probe tries the preferred block first, then falls back. If neither block has enough resources, `begin()` returns `false`.
+
+## Migration from v1.x
+
+**No code changes required.** The public API is identical. Just update the library and recompile.
+
+Behavioral differences:
+- **Volume quality**: Volume changes are now distortion-free. In v1.0, low volume settings distorted the waveform by making it asymmetric. In v2.1, volume controls the ultrasonic carrier duty cycle — the audible waveform stays symmetric at all levels.
+- **Resource usage**: Uses 1 additional state machine (2 total vs 1 in v1.0). No DMA channels needed.
+- **Auto-probe**: If the preferred PIO block is full, `begin()` transparently tries the other. In v1.0, it would just fail.
+
 ## FAQ
 
 **Q: Can I use this with NeoPixels / WS2812?**
-A: Yes. NeoPixel libraries typically use `pio0` SM0. BuzzerPIO auto-claims the next free SM. If `pio0` is full, construct with `pio1`: `BuzzerPIO buzzer(22, pio1);`
+A: Yes. NeoPixel libraries typically use `pio0` SM0. BuzzerPIO auto-claims the next free SMs. If `pio0` is full, pass `pio1`: `BuzzerPIO buzzer(22, pio1);`
 
 **Q: Can I have two buzzers?**
-A: Yes, each on its own GPIO and SM: `BuzzerPIO buzz1(22); BuzzerPIO buzz2(18);`. Each uses one SM from the same (or different) PIO block.
-
-**Q: Why not just use PWM?**
-A: PWM works for simple tones but has three issues: (1) each PWM slice is shared between two GPIOs — changing one affects the other; (2) there's no built-in melody sequencing; (3) the RP2040 has only 8 PWM slices, often needed for motors/LEDs. PIO state machines are independent and purpose-built for this.
+A: Only one per PIO block (each instance needs 2 SMs + 4 instruction slots). With both PIO blocks, you could have two buzzers on different blocks.
 
 **Q: Does this work on the Pico W?**
-A: Yes. The Pico W uses `pio1` SM0 for the CYW43 Wi-Fi driver. BuzzerPIO on `pio0` works without conflict. If you need `pio1`, it will auto-claim SM1 (leaving SM0 for Wi-Fi).
+A: Yes. The Pico W uses `pio1` SM0 for the CYW43 Wi-Fi driver. BuzzerPIO on `pio1` auto-claims SM1+SM2 (leaving SM0 for Wi-Fi). On `pio0`, there's no conflict at all.
 
 **Q: What about the Pico 2 (RP2350)?**
-A: The RP2350 has PIO v2 with the same instruction set. This library should work without changes, but has not been tested yet.
+A: The RP2350 has PIO v2 with the same instruction set and 3 PIO blocks. This library should work without changes, but has not been tested yet.
+
+**Q: Why ultrasonic PWM instead of direct frequency like v1.0?**
+A: In v1.0, volume was controlled by making the square wave asymmetric (e.g., 10% HIGH / 90% LOW). This changes the harmonic content — the tone sounds different at different volumes. In v2.1, the audible waveform is always a clean 50% duty square wave. Volume is controlled by the amplitude of an ultrasonic carrier that the buzzer's mechanical inertia filters out. The result: volume changes only change loudness, not timbre.
+
+**Q: Why two state machines instead of one?**
+A: The AND gate trick requires two independent signals on the same GPIO — one for value and one for output enable. A single SM can't toggle both independently at different frequencies. The dual-SM approach achieves this with zero DMA and zero IRQ handlers, using only PIO-internal hardware.
 
 ## Examples
 
 | Example | Description |
-|---------|-------------|
+|---|---|
 | [BasicTone](examples/BasicTone/BasicTone.ino) | Continuous/timed tones, volume sweep, frequency sweep |
 | [MelodyPlayer](examples/MelodyPlayer/MelodyPlayer.ino) | Predefined melodies, interactive serial replay |
 | [AlarmLoop](examples/AlarmLoop/AlarmLoop.ino) | Simulated temperature alarm with looping siren and button dismiss |

@@ -1,41 +1,62 @@
 /**
  * @file    BuzzerPIO_RP2040.cpp
- * @brief   Implementation of BuzzerPIO — PIO-driven passive buzzer.
- * @version 1.0.0
+ * @brief   BuzzerPIO v2.1 — Dual-SM AND gate: ultrasonic PWM × tone gate.
+ * @version 2.1.0
  * @license MIT
+ *
+ * SM1 (2 instr): ultrasonic PWM via `set pins` → controls GPIO value.
+ * SM2 (2 instr): audio gate via `set pindirs` → controls GPIO output enable.
+ * PIO ORs per-SM registers: value = SM1_val, OE = SM2_oe.
+ * With GPIO pull-down: output = SM1_pwm AND SM2_gate.
+ *
+ * Zero DMA. Zero IRQ handlers. Zero FIFO. Pure PIO hardware.
  */
 
 #include "BuzzerPIO_RP2040.h"
 #include "hardware/gpio.h"
+#include "hardware/structs/sio.h"
+
 
 // =========================================================================
-// PIO PROGRAM — 4-instruction square wave generator
+// PIO PROGRAM — 4 instructions, two sub-programs in shared memory
 //
-// Assembly:
-//   .program buzzer_square
-//   .wrap_target
-//       set pins, 1 [31]    ; HIGH phase part 1
-//       nop         [31]    ; HIGH phase part 2
-//       set pins, 0 [31]    ; LOW  phase part 1
-//       nop         [31]    ; LOW  phase part 2
-//   .wrap
+// SM1 wraps [0..1] — Ultrasonic PWM carrier (controls amplitude/volume):
+//   [0] set pins, 1  [dH]   ; HIGH for (dH+1) clocks — patched for volume
+//   [1] set pins, 0  [31]   ; LOW  for 32 clocks     — fixed
 //
-// Total period: 128 PIO clocks (4 instructions × 32 clocks each).
-// Frequency: sys_clk / (clk_div × 128).
-// Volume: duty cycle adjusted by patching delay fields at runtime.
+//   Period = 33 + dH.  At dH=31: period=64 → 50% duty (max volume).
+//   At dH=0: period=33 → 3% duty (min volume).
+//   Carrier = sys_clk / (SM1_clkdiv × period) → always ultrasonic.
+//
+// SM2 wraps [2..3] — Audio frequency tone gate (on/off at tone freq):
+//   [2] set pindirs, 1  [31]  ; OE=1 for 32 clocks (buzzer hears PWM)
+//   [3] set pindirs, 0  [31]  ; OE=0 for 32 clocks (buzzer sees LOW)
+//
+//   Period = 64 clocks.  Tone freq = sys_clk / (SM2_clkdiv × 64).
+//   SM2 only controls OE — it never touches the pin value.
+//
+// AND gate via hardware:
+//   SM1 sets pins VALUE but never touches OE → SM1_oe stays 0.
+//   SM2 sets PINDIRS (OE) but never touches value → SM2_val stays 0.
+//   PIO combines with OR: final_val = SM1_val, final_oe = SM2_oe.
+//   GPIO pull-down ensures pin = LOW when OE=0.
+//   Result: pin = SM1_pwm when SM2_gate=HIGH, else LOW.
 // =========================================================================
 
 const uint16_t BuzzerPIO::_programInstructions[4] = {
-    0xFF01,  // set pins, 1 [31]
-    0xBF00,  // nop         [31]  (encoded as mov y, y)
-    0xFF00,  // set pins, 0 [31]
-    0xBF00   // nop         [31]
+    // SM1: ultrasonic PWM (value control)
+    0xFF01,  // [0] set pins, 1 [31]  — HIGH phase (delay patched at runtime)
+    0xFF00,  // [1] set pins, 0 [31]  — LOW phase  (delay fixed at 31)
+
+    // SM2: audio frequency gate (OE control)
+    0xFF81,  // [2] set pindirs, 1 [31]  — gate OPEN
+    0xFF80   // [3] set pindirs, 0 [31]  — gate CLOSED
 };
 
 const struct pio_program BuzzerPIO::_program = {
     .instructions = _programInstructions,
     .length       = 4,
-    .origin       = -1  // auto-allocate offset
+    .origin       = -1
 };
 
 
@@ -44,10 +65,55 @@ const struct pio_program BuzzerPIO::_program = {
 // =========================================================================
 
 BuzzerPIO::BuzzerPIO(uint8_t pin, PIO pio)
-    : _pio(pio), _pin(pin) {}
+    : _pio(pio), _preferredPio(pio), _pin(pin) {}
 
 BuzzerPIO::~BuzzerPIO() {
     end();
+}
+
+
+// =========================================================================
+// PIO ALLOCATION — needs 4 instruction slots + 2 state machines
+//
+// IMPORTANT: Both SMs MUST be in the same PIO block. The RP2040 ORs
+// per-SM outputs (value, OE) within a single PIO block. SMs in different
+// blocks cannot interact — their outputs go to independent GPIO muxes.
+// The auto-probe tries the preferred block first, then falls back to
+// the other. It NEVER splits SMs across blocks.
+// =========================================================================
+
+bool BuzzerPIO::_tryAllocPio(PIO pio) {
+    // Check instruction memory
+    if (!pio_can_add_program(pio, &_program)) return false;
+    _offset = pio_add_program(pio, &_program);
+
+    // Claim SM1 (PWM carrier)
+    int sm1 = pio_claim_unused_sm(pio, false);
+    if (sm1 < 0) {
+        pio_remove_program(pio, &_program, _offset);
+        return false;
+    }
+
+    // Claim SM2 (tone gate)
+    int sm2 = pio_claim_unused_sm(pio, false);
+    if (sm2 < 0) {
+        pio_sm_unclaim(pio, sm1);
+        pio_remove_program(pio, &_program, _offset);
+        return false;
+    }
+
+    _pio    = pio;
+    _smPwm  = (uint)sm1;
+    _smGate = (uint)sm2;
+    return true;
+}
+
+void BuzzerPIO::_freePio() {
+    pio_sm_set_enabled(_pio, _smPwm, false);
+    pio_sm_set_enabled(_pio, _smGate, false);
+    pio_sm_unclaim(_pio, _smPwm);
+    pio_sm_unclaim(_pio, _smGate);
+    pio_remove_program(_pio, &_program, _offset);
 }
 
 
@@ -56,56 +122,71 @@ BuzzerPIO::~BuzzerPIO() {
 // =========================================================================
 
 bool BuzzerPIO::begin() {
-    if (_ready) return true;  // Already initialized
+    if (_ready) return true;
 
-    // Allocate instruction memory in the PIO block
-    if (!pio_can_add_program(_pio, &_program)) {
-        return false;
+    // ── 1. Auto-probe: try preferred PIO, fallback to the other ──────
+    if (!_tryAllocPio(_preferredPio)) {
+        PIO fallback = (_preferredPio == pio0) ? pio1 : pio0;
+        if (!_tryAllocPio(fallback)) return false;
     }
-    _offset = pio_add_program(_pio, &_program);
 
-    // Claim a free state machine
-    int claimed = pio_claim_unused_sm(_pio, false);
-    if (claimed < 0) {
-        pio_remove_program(_pio, &_program, _offset);
-        return false;
+    // ── 2. Configure SM1 (PWM carrier) ───────────────────────────────
+    //   Wraps over instructions [0..1]. Controls pin VALUE via set pins.
+    //   Clock divider fixed → ultrasonic carrier frequency.
+    //   OE is NEVER set by SM1 → SM1_oe stays 0 after pio_sm_init.
+    {
+        pio_sm_config cfg = pio_get_default_sm_config();
+        sm_config_set_wrap(&cfg, _offset + 0, _offset + 1);
+        sm_config_set_set_pins(&cfg, _pin, 1);
+        sm_config_set_clkdiv_int_frac(&cfg, BUZZER_PWM_CLKDIV, 0);
+
+        // Init SM1 — this resets output value and OE to 0 for all pins
+        pio_sm_init(_pio, _smPwm, _offset + 0, &cfg);
+        // Deliberately NOT calling pio_sm_set_consecutive_pindirs for SM1.
+        // SM1's OE for the buzzer pin stays 0 → no direct output to pad.
+        // SM1 only provides the VALUE; SM2 gates it via OE.
     }
-    _sm = (uint)claimed;
 
-    // Configure the state machine
-    pio_sm_config cfg = pio_get_default_sm_config();
-    sm_config_set_wrap(&cfg, _offset + 0, _offset + 3);
-    sm_config_set_set_pins(&cfg, _pin, 1);
-    sm_config_set_clkdiv(&cfg, 1.0f);
+    // ── 3. Configure SM2 (tone gate) ─────────────────────────────────
+    //   Wraps over instructions [2..3]. Controls pin OE via set pindirs.
+    //   Clock divider dynamic → audio frequency.
+    //   VALUE is NEVER set by SM2 → SM2_val stays 0 after pio_sm_init.
+    {
+        pio_sm_config cfg = pio_get_default_sm_config();
+        sm_config_set_wrap(&cfg, _offset + 2, _offset + 3);
+        sm_config_set_set_pins(&cfg, _pin, 1);
+        sm_config_set_clkdiv(&cfg, 65535.0f);  // Placeholder (very slow)
 
-    // Initialize GPIO as PIO output, driven LOW
+        // Init SM2 — output value and OE reset to 0
+        pio_sm_init(_pio, _smGate, _offset + 2, &cfg);
+        // SM2 will control OE via `set pindirs` instructions.
+    }
+
+    // ── 4. GPIO: mux to PIO + enable pull-down ───────────────────────
+    //   Pull-down ensures pin = LOW when OE=0 (gate closed).
     pio_gpio_init(_pio, _pin);
-    pio_sm_set_consecutive_pindirs(_pio, _sm, _pin, 1, true);
+    gpio_pull_down(_pin);
 
-    // Load config and keep SM stopped until tone() is called
-    pio_sm_init(_pio, _sm, _offset, &cfg);
-    pio_sm_set_enabled(_pio, _sm, false);
-
-    // Apply default volume (100% = 50% duty)
+    // ── 5. Apply default volume (patches SM1 instruction delays) ─────
     _setDuty();
+
+    // ── 6. Start SM1 (PWM runs continuously — inaudible without gate)
+    pio_sm_set_enabled(_pio, _smPwm, true);
+
+    // SM2 stays disabled until tone() or playMelody() is called.
 
     _ready = true;
     return true;
 }
 
+
 void BuzzerPIO::end() {
     if (!_ready) return;
 
-    // Stop everything
     stopMelody();
     noTone();
+    _freePio();
 
-    // Release PIO resources
-    pio_sm_set_enabled(_pio, _sm, false);
-    pio_sm_unclaim(_pio, _sm);
-    pio_remove_program(_pio, &_program, _offset);
-
-    // Return GPIO to standard digital output LOW
     gpio_set_function(_pin, GPIO_FUNC_SIO);
     gpio_set_dir(_pin, GPIO_OUT);
     gpio_put(_pin, 0);
@@ -121,28 +202,23 @@ void BuzzerPIO::end() {
 void BuzzerPIO::tone(uint16_t freqHz) {
     if (!_ready) return;
 
-    // Cancel any pending alarm (timed tone or melody)
     _cancelAlarm();
-    _melody = nullptr;
+    _melody  = nullptr;
     _looping = false;
 
     if (freqHz == 0 || _volume == 0) {
         _toneStop();
         return;
     }
-
     _toneStart(freqHz);
 }
 
 void BuzzerPIO::tone(uint16_t freqHz, uint16_t durationMs) {
     if (!_ready || durationMs == 0) return;
 
-    // Start the tone (also cancels pending alarm/melody)
     tone(freqHz);
-
     if (freqHz == 0 || _volume == 0) return;
 
-    // Schedule auto-shutoff via hardware alarm
     _alarm = add_alarm_in_ms(durationMs, _timedToneCallback, this, false);
 }
 
@@ -150,16 +226,11 @@ void BuzzerPIO::noTone() {
     if (!_ready) return;
 
     _cancelAlarm();
-    _melody = nullptr;
+    _melody  = nullptr;
     _looping = false;
     _toneStop();
 }
 
-/**
- * @brief  Hardware alarm callback for timed single tone.
- *         Runs in IRQ context — only register writes, no heap/mutex.
- * @return 0 = one-shot (do not re-schedule).
- */
 int64_t BuzzerPIO::_timedToneCallback(alarm_id_t id, void* user) {
     BuzzerPIO* self = static_cast<BuzzerPIO*>(user);
     if (self) {
@@ -171,7 +242,7 @@ int64_t BuzzerPIO::_timedToneCallback(alarm_id_t id, void* user) {
 
 
 // =========================================================================
-// VOLUME
+// VOLUME — patches SM1 instruction delays (same mechanism as v1.0)
 // =========================================================================
 
 void BuzzerPIO::setVolume(uint8_t volume) {
@@ -179,38 +250,72 @@ void BuzzerPIO::setVolume(uint8_t volume) {
     if (_ready) _setDuty();
 }
 
+/**
+ * @brief  Patch SM1 instruction delays to set PWM duty cycle.
+ *
+ *   Instruction [0]: set pins, 1 [dH]  → HIGH for (dH+1) clocks.
+ *   Instruction [1]: set pins, 0 [dL]  → LOW  for (dL+1) clocks.
+ *   Period = dH + dL + 2.  Duty = (dH+1) / (dH+dL+2).
+ *
+ *   Volume 100 → dH=31, dL=0  → duty 97% (period=33).
+ *   Volume  50 → dH=15, dL=16 → duty 50% (period=33).
+ *   Volume   1 → dH=0,  dL=31 → duty  3% (period=33).
+ *   Volume   0 → SM2 disabled (silence via gate).
+ *
+ *   Period is always 33 clocks → carrier is fixed at
+ *   125MHz / (BUZZER_PWM_CLKDIV × 33) regardless of volume.
+ *   At CLKDIV=40: carrier ≈ 94.7 kHz (constant, ultrasonic).
+ */
+void BuzzerPIO::_setDuty() {
+    if (_volume == 0) {
+        // Mute: disable gate SM → OE=0 → pin pulled LOW via pull-down
+        pio_sm_set_enabled(_pio, _smGate, false);
+        pio_sm_exec(_pio, _smGate, pio_encode_set(pio_pindirs, 0));
+        return;
+    }
+
+    // Map volume 1–100 → dH 0–31 (HIGH delay field)
+    uint8_t dH = (uint8_t)(((uint32_t)(_volume - 1) * 31) / 99);
+    // LOW delay = complement → total delay fields always sum to 31
+    uint8_t dL = 31 - dH;
+
+    // Build patched instructions:
+    //   set pins, 1 [dH] = 0xE001 | (dH << 8)
+    //   set pins, 0 [dL] = 0xE000 | (dL << 8)
+    uint16_t instr0 = 0xE001 | ((uint16_t)dH << 8);
+    uint16_t instr1 = 0xE000 | ((uint16_t)dL << 8);
+
+    // Patch SM1 instruction memory (briefly disable to avoid glitch)
+    bool wasEnabled = _pio->ctrl & (1u << _smPwm);
+    pio_sm_set_enabled(_pio, _smPwm, false);
+
+    _pio->instr_mem[_offset + 0] = instr0;
+    _pio->instr_mem[_offset + 1] = instr1;
+
+    if (wasEnabled) {
+        pio_sm_set_enabled(_pio, _smPwm, true);
+    }
+}
+
 
 // =========================================================================
-// MELODY PLAYBACK — Hardware alarm chain
-//
-// Each note is configured in the PIO and a hardware alarm is scheduled
-// for its duration. When the alarm fires, the IRQ callback advances to
-// the next note (or loops back to the beginning). All note transitions
-// happen with < 10 µs jitter, completely independent of the main loop.
-//
-// The callback returns a negative value to re-schedule relative to the
-// previous fire time, ensuring cumulative timing without drift.
+// MELODY PLAYBACK — Hardware alarm chain (identical to v1.0)
 // =========================================================================
 
 void BuzzerPIO::playMelody(const BuzzerNote* notes, uint8_t len) {
     if (!_ready || !notes || len == 0) return;
 
-    // Stop current playback
     _cancelAlarm();
     _toneStop();
 
-    // Store melody reference (must remain valid for duration of playback)
     _melody    = notes;
     _melodyLen = len;
     _noteIndex = 0;
     _looping   = false;
 
-    // Start first note
     if (notes[0].freqHz > 0 && _volume > 0) {
         _toneStart(notes[0].freqHz);
     }
-
-    // Schedule alarm for first note's duration
     _alarm = add_alarm_in_ms(notes[0].durationMs, _melodyCallback, this, false);
 }
 
@@ -228,7 +333,6 @@ void BuzzerPIO::playMelodyLoop(const BuzzerNote* notes, uint8_t len) {
     if (notes[0].freqHz > 0 && _volume > 0) {
         _toneStart(notes[0].freqHz);
     }
-
     _alarm = add_alarm_in_ms(notes[0].durationMs, _melodyCallback, this, false);
 }
 
@@ -239,194 +343,114 @@ void BuzzerPIO::stopMelody() {
     _toneStop();
 }
 
-/**
- * @brief  Hardware alarm callback — advances melody in IRQ context.
- *
- *         Configures the PIO for the next note via register writes
- *         (IRQ-safe). Returns negative µs to re-schedule the alarm
- *         relative to the previous fire time (no drift accumulation).
- *
- * @return Negative µs = re-schedule; 0 = melody finished.
- */
 int64_t BuzzerPIO::_melodyCallback(alarm_id_t id, void* user) {
     BuzzerPIO* self = static_cast<BuzzerPIO*>(user);
     if (!self || !self->_melody) return 0;
 
     uint8_t nextIdx = self->_noteIndex + 1;
 
-    // End of melody?
     if (nextIdx >= self->_melodyLen) {
         if (self->_looping) {
-            nextIdx = 0;  // Restart from beginning
+            nextIdx = 0;
         } else {
-            // One-shot: silence and stop
             self->_stopIrqSafe();
             self->_melody = nullptr;
-            self->_alarm = 0;
+            self->_alarm  = 0;
             return 0;
         }
     }
 
     self->_noteIndex = nextIdx;
 
-    // Access note (cast away volatile — safe, we're the only writer in IRQ)
     const BuzzerNote* melody = (const BuzzerNote*)self->_melody;
-    const BuzzerNote& note = melody[nextIdx];
+    const BuzzerNote& note   = melody[nextIdx];
 
-    // Configure PIO for the new note
     if (note.freqHz > 0 && self->_volume > 0) {
-        pio_gpio_init(self->_pio, self->_pin);
-        self->_setFreq(note.freqHz);
-        pio_sm_restart(self->_pio, self->_sm);
-        pio_sm_set_enabled(self->_pio, self->_sm, true);
+        // _toneStart re-enables SM1 (PWM) if it was disabled by a
+        // preceding silent note's _stopIrqSafe(), and re-muxes GPIO
+        // back to PIO function. Critical for melody loop continuity.
+        self->_toneStart(note.freqHz);
     } else {
         self->_stopIrqSafe();
     }
 
-    // Re-schedule for this note's duration (negative = relative to last fire)
     return -(int64_t)note.durationMs * 1000;
 }
 
 
 // =========================================================================
-// INTERNAL — PIO CONTROL
+// INTERNAL — TONE CONTROL
 // =========================================================================
 
 /**
- * @brief  Start the PIO generating a tone at the given frequency.
- *         Restores GPIO to PIO function, sets clock divider, resets PC.
+ * @brief  Start a tone: set SM2 clock divider and enable gate.
+ *         SM1 (PWM) runs continuously — only SM2 is started/stopped.
  */
 void BuzzerPIO::_toneStart(uint16_t freqHz) {
+    // Ensure GPIO is muxed to PIO
     pio_gpio_init(_pio, _pin);
+
+    // Ensure SM1 (PWM) is running
+    if (!(_pio->ctrl & (1u << _smPwm))) {
+        pio_sm_restart(_pio, _smPwm);
+        pio_sm_set_enabled(_pio, _smPwm, true);
+    }
+
+    // Set SM2 frequency and start gate
     _setFreq(freqHz);
-    pio_sm_restart(_pio, _sm);
-    pio_sm_set_enabled(_pio, _sm, true);
+    pio_sm_restart(_pio, _smGate);
+    pio_sm_set_enabled(_pio, _smGate, true);
 }
 
 /**
- * @brief  Stop the PIO and force GPIO LOW (full silence).
- *         Restores GPIO as PIO output for the next activation.
+ * @brief  Stop tone: disable SM2 gate, force OE=0.
+ *         SM1 (PWM) keeps running (inaudible without gate).
  */
 void BuzzerPIO::_toneStop() {
     if (!_ready) return;
 
-    pio_sm_set_enabled(_pio, _sm, false);
-
-    // Force LOW via SIO to prevent DC offset on the buzzer
-    gpio_set_function(_pin, GPIO_FUNC_SIO);
-    gpio_set_dir(_pin, GPIO_OUT);
-    gpio_put(_pin, 0);
-
-    // Restore as PIO output for next use
-    pio_gpio_init(_pio, _pin);
+    pio_sm_set_enabled(_pio, _smGate, false);
+    // Force OE=0 so pin goes to pull-down (LOW)
+    pio_sm_exec(_pio, _smGate, pio_encode_set(pio_pindirs, 0));
 }
 
 /**
- * @brief  IRQ-safe stop — minimal register writes only.
- *         Does NOT restore PIO function (done on next _toneStart).
+ * @brief  IRQ-safe stop — disable both SMs, switch GPIO to SIO, force LOW.
+ *         Only register writes — safe from alarm callbacks.
  */
 void BuzzerPIO::_stopIrqSafe() {
-    pio_sm_set_enabled(_pio, _sm, false);
-    sio_hw->gpio_clr = (1u << _pin);
+    pio_sm_set_enabled(_pio, _smGate, false);
+    pio_sm_set_enabled(_pio, _smPwm, false);
+
+    // Switch GPIO to SIO and force LOW
+    gpio_set_function(_pin, GPIO_FUNC_SIO);
     sio_hw->gpio_oe_set = (1u << _pin);
+    sio_hw->gpio_clr    = (1u << _pin);
 }
 
 /**
- * @brief  Cancel a pending hardware alarm (if any).
+ * @brief  Set SM2 clock divider for the desired tone frequency.
+ *         SM2 period = 64 PIO clocks → freq = sys_clk / (clkdiv × 64).
  */
+void BuzzerPIO::_setFreq(uint16_t freqHz) {
+    if (freqHz == 0) return;
+
+    uint32_t sysClk    = clock_get_hz(clk_sys);
+    uint32_t target    = (uint32_t)freqHz * 64;
+
+    uint32_t divInt    = sysClk / target;
+    uint32_t remainder = sysClk % target;
+    uint32_t divFrac   = (remainder * 256) / target;
+
+    if (divInt == 0)     { divInt = 1; divFrac = 0; }
+    if (divInt > 65535)  { divInt = 65535; divFrac = 0; }
+
+    pio_sm_set_clkdiv_int_frac(_pio, _smGate, (uint16_t)divInt, (uint8_t)divFrac);
+}
+
 void BuzzerPIO::_cancelAlarm() {
     if (_alarm > 0) {
         cancel_alarm(_alarm);
         _alarm = 0;
-    }
-}
-
-
-// =========================================================================
-// INTERNAL — FREQUENCY AND DUTY CYCLE
-// =========================================================================
-
-/**
- * @brief  Set the PIO clock divider for the target frequency.
- *         freq = sys_clk / (clk_div × 128)
- */
-void BuzzerPIO::_setFreq(uint16_t freqHz) {
-    if (freqHz == 0) {
-        pio_sm_set_enabled(_pio, _sm, false);
-        return;
-    }
-
-    uint32_t sysClk = clock_get_hz(clk_sys);
-    uint32_t target = (uint32_t)freqHz * 128;
-
-    uint32_t divInt  = sysClk / target;
-    uint32_t remainder = sysClk % target;
-    uint32_t divFrac = (remainder * 256) / target;
-
-    // Clamp: minimum divider = 1.0
-    if (divInt == 0) { divInt = 1; divFrac = 0; }
-
-    // Clamp: maximum divider = 65535
-    if (divInt > 65535) { divInt = 65535; divFrac = 0; }
-
-    pio_sm_set_clkdiv_int_frac(_pio, _sm, (uint16_t)divInt, (uint8_t)divFrac);
-}
-
-/**
- * @brief  Patch PIO instruction delays to set duty cycle (volume).
- *
- *         Volume 100% → 50% duty (64 HIGH + 64 LOW) → max amplitude.
- *         Volume 1%   → ~1.6% duty (2 HIGH + 126 LOW) → barely audible.
- *         Volume 0%   → SM disabled (complete silence).
- *
- *         Granularity: 64 effective levels (~1.6% per step).
- */
-void BuzzerPIO::_setDuty() {
-    if (_volume == 0) {
-        pio_sm_set_enabled(_pio, _sm, false);
-        return;
-    }
-
-    // Map volume 1–100 → highClocks 2–64
-    uint32_t highClocks = 2 + ((uint32_t)(_volume - 1) * 62) / 99;
-    uint32_t lowClocks  = 128 - highClocks;
-
-    // Distribute HIGH clocks across Slot 0 and Slot 1
-    // Each slot contributes (delay + 1) clocks; delay is 5 bits (0–31).
-    uint8_t dh_sum = (uint8_t)(highClocks - 2);
-    uint8_t dh1 = (dh_sum > 31) ? 31 : dh_sum;
-    uint8_t dh2 = dh_sum - dh1;
-
-    // Distribute LOW clocks across Slot 2 and Slot 3
-    uint8_t dl_sum = (uint8_t)(lowClocks - 2);
-    uint8_t dl1 = (dl_sum > 31) ? 31 : dl_sum;
-    uint8_t dl2 = dl_sum - dl1;
-
-    // Clamp dl2 to 31 max (5-bit delay field).
-    // For very low volumes (< ~50%), the total period may be slightly
-    // shorter than 128 clocks (~3% frequency shift — imperceptible
-    // on a passive buzzer).
-    if (dl2 > 31) dl2 = 31;
-
-    // Build patched instructions
-    //   set pins, 1 [d] = 0xE001 | (d << 8)
-    //   nop         [d] = 0xA000 | (d << 8)
-    //   set pins, 0 [d] = 0xE000 | (d << 8)
-    uint16_t instr0 = 0xE001 | ((uint16_t)dh1 << 8);
-    uint16_t instr1 = 0xA000 | ((uint16_t)dh2 << 8);
-    uint16_t instr2 = 0xE000 | ((uint16_t)dl1 << 8);
-    uint16_t instr3 = 0xA000 | ((uint16_t)dl2 << 8);
-
-    // Patch instruction memory (briefly disable SM to avoid glitch)
-    bool wasEnabled = _pio->ctrl & (1u << _sm);
-    pio_sm_set_enabled(_pio, _sm, false);
-
-    _pio->instr_mem[_offset + 0] = instr0;
-    _pio->instr_mem[_offset + 1] = instr1;
-    _pio->instr_mem[_offset + 2] = instr2;
-    _pio->instr_mem[_offset + 3] = instr3;
-
-    if (wasEnabled) {
-        pio_sm_set_enabled(_pio, _sm, true);
     }
 }

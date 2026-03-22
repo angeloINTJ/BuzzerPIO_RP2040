@@ -103,7 +103,7 @@ void setup() {
     Serial.println("========================================\n");
 
     if (!buzzer.begin()) {
-        Serial.println("ERROR: PIO init failed!");
+        Serial.println("ERROR: PIO init failed! Need 4 instr + 2 SMs.");
         while (true) delay(1000);
     }
 
