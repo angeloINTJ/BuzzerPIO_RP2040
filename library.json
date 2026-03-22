@@ -1,0 +1,29 @@
+{
+    "name": "BuzzerPIO_RP2040",
+    "version": "1.0.0",
+    "description": "Zero-jitter tone generation for passive buzzers using the RP2040 PIO coprocessor. Hardware-timed melody sequencing, volume control, non-blocking API.",
+    "keywords": [
+        "buzzer",
+        "tone",
+        "melody",
+        "pio",
+        "rp2040",
+        "pico",
+        "pico-w",
+        "square-wave",
+        "hardware-accelerated",
+        "non-blocking"
+    ],
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/angeloINTJ/BuzzerPIO_RP2040.git"
+    },
+    "authors": [
+        {
+            "name": "Ângelo Moisés Alves"
+        }
+    ],
+    "license": "MIT",
+    "frameworks": "arduino",
+    "platforms": "raspberrypi"
+}

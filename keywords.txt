@@ -1,0 +1,27 @@
+# =========================================================================
+# BuzzerPIO_RP2040 — keywords.txt
+# Syntax highlighting para Arduino IDE
+# =========================================================================
+
+# Classes (KEYWORD1)
+BuzzerPIO	KEYWORD1
+
+# Structs (KEYWORD1)
+BuzzerNote	KEYWORD1
+
+# Methods (KEYWORD2)
+begin	KEYWORD2
+end	KEYWORD2
+tone	KEYWORD2
+noTone	KEYWORD2
+setVolume	KEYWORD2
+getVolume	KEYWORD2
+playMelody	KEYWORD2
+playMelodyLoop	KEYWORD2
+stopMelody	KEYWORD2
+isPlaying	KEYWORD2
+isLooping	KEYWORD2
+
+# Constants (LITERAL1)
+BUZZER_PIO_MAX_FREQ	LITERAL1
+BUZZER_PIO_MIN_FREQ	LITERAL1
