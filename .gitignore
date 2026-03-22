@@ -1,0 +1,15 @@
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Build
+build/
+.pio/
+__pycache__/
+
+# OS
+.DS_Store
+Thumbs.db
