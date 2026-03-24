@@ -1,7 +1,7 @@
 {
     "name": "BuzzerPIO_RP2040",
-    "version": "2.1.0",
-    "description": "Ultrasonic PWM tone generation for passive buzzers using dual PIO state machines. Distortion-free volume control, hardware-timed melody sequencing, zero DMA, zero IRQ, auto-probe PIO blocks.",
+    "version": "2.5.0",
+    "description": "Ultrasonic PWM tone generation for passive buzzers using dual PIO state machines. Distortion-free volume control with perceptual curve, hardware-timed melody sequencing with completion callback, pause/resume, zero DMA, zero IRQ, auto-probe PIO blocks. Multi-core safe.",
     "keywords": [
         "buzzer",
         "tone",
@@ -15,7 +15,8 @@
         "hardware-accelerated",
         "non-blocking",
         "dual-sm",
-        "volume-control"
+        "volume-control",
+        "multi-core"
     ],
     "repository": {
         "type": "git",
@@ -26,6 +27,7 @@
             "name": "Ângelo Moisés Alves"
         }
     ],
+    "homepage": "https://github.com/angeloINTJ/BuzzerPIO_RP2040",
     "license": "MIT",
     "frameworks": "arduino",
     "platforms": "raspberrypi"

@@ -8,6 +8,8 @@
  *   - Using freq=0 for silent pauses within a melody
  *   - Checking playback status with isPlaying()
  *   - Playing multiple melodies in sequence
+ *   - v2.5: Melody completion callback (setMelodyDoneCallback)
+ *   - v2.5: Pause/resume melody playback
  *
  * Wiring:
  *   - Passive buzzer between GP22 and GND
@@ -20,6 +22,19 @@
 #include <BuzzerPIO_RP2040.h>
 
 BuzzerPIO buzzer(22, pio0);
+
+// ── Melody completion flag (set from IRQ, read from loop) ────────────
+volatile bool melodyFinished = false;
+
+/**
+ * @brief  Callback fired when a one-shot melody finishes.
+ *
+ * @warning Runs in IRQ context — only set a flag here.
+ *          Do NOT call Serial, delay(), or any blocking function.
+ */
+void onMelodyDone(void* /* userData */) {
+    melodyFinished = true;
+}
 
 // ── Melody definitions ───────────────────────────────────────────────
 // Each note: { frequency_Hz, duration_ms }
@@ -81,7 +96,7 @@ const BuzzerNote melodyFanfare[] = {
 struct MelodyEntry {
     const char*       name;
     const BuzzerNote* notes;
-    uint8_t           len;
+    uint16_t          len;
 };
 
 const MelodyEntry allMelodies[] = {
@@ -109,7 +124,12 @@ void setup() {
 
     buzzer.setVolume(70);
 
-    // Play each melody with a pause between them
+    // ── Register melody completion callback ──────────────────────────
+    // The callback sets melodyFinished=true (from IRQ), so we can
+    // react in loop() without polling isPlaying().
+    buzzer.setMelodyDoneCallback(onMelodyDone);
+
+    // ── Play each melody using the callback to detect completion ─────
     for (int i = 0; i < MELODY_COUNT; i++) {
         Serial.print("Playing: ");
         Serial.print(allMelodies[i].name);
@@ -117,20 +137,40 @@ void setup() {
         Serial.print(allMelodies[i].len);
         Serial.println(" notes)...");
 
+        melodyFinished = false;
         buzzer.playMelody(allMelodies[i].notes, allMelodies[i].len);
 
-        // Wait for melody to finish (non-blocking check)
-        while (buzzer.isPlaying()) {
-            // CPU is free to do other work here!
-            // For example, check sensors, update display, etc.
+        // Wait for completion callback (CPU is free between checks!)
+        while (!melodyFinished) {
+            // Could do sensor reads, display updates, etc. here
             delay(10);
         }
 
-        Serial.println("  Done.");
+        Serial.println("  Done (callback received).");
         delay(800);  // Pause between melodies
     }
 
-    Serial.println("\nAll melodies played!");
+    // ── Demonstrate pause/resume with the scale melody ───────────────
+    Serial.println("\n--- Pause/Resume Demo ---");
+    Serial.println("Playing C Major scale, will pause mid-way...\n");
+
+    melodyFinished = false;
+    buzzer.playMelody(melodyScale, sizeof(melodyScale) / sizeof(BuzzerNote));
+
+    // Let it play a few notes, then pause
+    delay(500);
+    Serial.println("  PAUSED (isPaused = true)");
+    buzzer.pauseMelody();
+    delay(1500);  // Silence for 1.5 seconds
+
+    Serial.println("  RESUMED");
+    buzzer.resumeMelody();
+
+    // Wait for it to finish
+    while (!melodyFinished) delay(10);
+    Serial.println("  Scale finished after resume.\n");
+
+    Serial.println("All demos complete!");
     Serial.println("Send 1-6 via Serial to replay a melody.");
 }
 

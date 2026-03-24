@@ -26,7 +26,7 @@ What actually happened (include Serial output if relevant).
 - **Board**: Pico / Pico W / other RP2040 board
 - **Arduino core**: Earle Philhower vX.X.X
 - **IDE**: Arduino IDE / PlatformIO / other
-- **Library version**: 1.0.0
+- **Library version**: X.X.X
 - **PIO block used**: pio0 / pio1
 
 ## Additional context

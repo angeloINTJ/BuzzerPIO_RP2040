@@ -52,6 +52,8 @@ void setup() {
     delay(1000);              // CPU is free during tone
 
     // ── Example 3: Volume sweep ────────────────────────────────────
+    // v2.5: Quadratic volume curve — perceived loudness now increases
+    // evenly. Low volumes (10-30) are more distinguishable than before.
     Serial.println("3. Volume sweep at 880 Hz (A5)...");
     for (int vol = 10; vol <= 100; vol += 10) {
         buzzer.setVolume(vol);

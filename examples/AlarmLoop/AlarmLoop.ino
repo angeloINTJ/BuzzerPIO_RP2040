@@ -8,6 +8,7 @@
  *   - isLooping() to check alarm state
  *   - Multiple alarm patterns (selectable via Serial)
  *   - Simulated temperature-triggered alarm
+ *   - v2.5: pauseMelody() / resumeMelody() for temporary mute
  *
  * Wiring:
  *   - Passive buzzer on GP22
@@ -75,7 +76,7 @@ const BuzzerNote confirmBeep[] = {
 struct AlarmPattern {
     const char*       name;
     const BuzzerNote* notes;
-    uint8_t           len;
+    uint16_t          len;
 };
 
 const AlarmPattern patterns[] = {
@@ -117,6 +118,7 @@ void setup() {
     Serial.println("  + / -   : Adjust simulated temperature");
     Serial.println("  1-4     : Change alarm pattern");
     Serial.println("  d       : Dismiss alarm");
+    Serial.println("  p       : Pause/Resume alarm (temporary mute)");
     Serial.print("\nAlarm threshold: ");
     Serial.print(TEMP_THRESHOLD, 1);
     Serial.println(" C\n");
@@ -172,6 +174,19 @@ void loop() {
             case 'D':
                 if (alarmActive) dismissAlarm();
                 break;
+            case 'p':
+            case 'P':
+                // v2.5: Toggle pause/resume for temporary mute
+                if (alarmActive) {
+                    if (buzzer.isPaused()) {
+                        buzzer.resumeMelody();
+                        Serial.println("Alarm RESUMED.");
+                    } else {
+                        buzzer.pauseMelody();
+                        Serial.println("Alarm PAUSED (temp mute).");
+                    }
+                }
+                break;
             case '1': case '2': case '3': case '4': {
                 int idx = c - '1';
                 if (idx < PATTERN_COUNT) {
@@ -193,7 +208,9 @@ void loop() {
 
     // ── LED blink during alarm ──────────────────────────────────────
     if (alarmActive) {
-        digitalWrite(LED_PIN, (millis() / 300) % 2);
+        // Slow blink when paused, fast blink when active
+        uint32_t blinkRate = buzzer.isPaused() ? 800 : 300;
+        digitalWrite(LED_PIN, (millis() / blinkRate) % 2);
     }
 }
 
@@ -215,7 +232,7 @@ void printStatus() {
     Serial.print(" C | Threshold: ");
     Serial.print(TEMP_THRESHOLD, 1);
     Serial.print(" C | Alarm: ");
-    Serial.print(alarmActive ? "ACTIVE" : "off");
+    Serial.print(alarmActive ? (buzzer.isPaused() ? "PAUSED" : "ACTIVE") : "off");
     Serial.print(" | Pattern: ");
     Serial.println(patterns[currentPattern].name);
 }
