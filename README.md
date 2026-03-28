@@ -24,20 +24,20 @@ The standard Arduino `tone()` function on the RP2040 has several problems:
 
 ```
           SM1 (ultrasonic PWM)              SM2 (tone gate)
-          ┌─────────────────┐              ┌─────────────────┐
-          │ set pins,1 [dH] │              │ set pindirs,1[31]│
-clkdiv=40 │ set pins,0 [dL] │  clkdiv=var  │ set pindirs,0[31]│
-  ~95 kHz │ (wraps [0..1])  │  =tone freq  │ (wraps [2..3])  │
-          └────────┬────────┘              └────────┬────────┘
+          ┌─────────────────┐              ┌───────────────────┐
+          │ set pins,1 [dH] │              │ set pindirs,1[31] │
+clkdiv=40 │ set pins,0 [dL] │  clkdiv=var  │ set pindirs,0[31] │
+  ~95 kHz │ (wraps [0..1])  │  =tone freq  │ (wraps [2..3])    │
+          └────────┬────────┘              └────────┬──────────┘
                    │ VALUE                          │ OE
                    │                                │
-          PIO combines: value = SM1_val, OE = SM2_oe
+               PIO combines: value = SM1_val, OE = SM2_oe
                    │                                │
-                   └──────── GPIO pin ──────────────┘
-                             │
-                        pull-down R
-                             │
-                            GND
+                   └──────────── GPIO pin ──────────┘
+                                    │
+                                pull-down R
+                                    │
+                                   GND
 
 OE=1 → pin outputs SM1 PWM (buzzer hears ultrasonic carrier)
 OE=0 → pin hi-Z → pulled LOW (silence)
