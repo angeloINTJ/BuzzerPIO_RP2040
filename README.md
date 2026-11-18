@@ -53,7 +53,7 @@ Result: output = SM1_pwm AND SM2_gate
 
 4. **Volume** — Patching SM1's instruction delays changes the PWM duty cycle from 3% (barely audible) to 97% (maximum). v2.5 uses a quadratic mapping curve so that perceived loudness increases evenly across the 0–100 range (matching human hearing's logarithmic response). The carrier frequency stays constant at ~95 kHz regardless of volume — no harmonic distortion, no frequency shift.
 
-5. **Melody sequencing** — Hardware alarm chain (same proven mechanism as v1.0). Each note transition sets SM2's clock divider for the new frequency. All note transitions happen with < 10 µs jitter, completely independent of the main loop.
+5. **Melody sequencing** — Hardware alarm chain (same proven mechanism as v1.0). Each note transition stops SM2, sets its clock divider for the new frequency and restarts it on the ON half of its cycle, so every note opens one gate tick (1/64 of its period), plus the callback's latency, after its alarm fires. All note transitions happen with < 10 µs jitter, completely independent of the main loop. (Up to v2.5.0 a note could open on its OFF half, up to half a period late; v2.5.1 fixed it.)
 
 ## Installation
 

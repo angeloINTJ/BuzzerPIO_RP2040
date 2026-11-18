@@ -1,7 +1,7 @@
 /**
  * @file    BuzzerPIO_RP2040.cpp
  * @brief   BuzzerPIO v2.5 — Dual-SM AND gate: ultrasonic PWM × tone gate.
- * @version 2.5.0
+ * @version 2.5.1
  * @license MIT
  *
  * SM1 (2 instr): ultrasonic PWM via `set pins` → controls GPIO value.
@@ -10,6 +10,10 @@
  * With GPIO pull-down: output = SM1_pwm AND SM2_gate.
  *
  * Zero DMA. Zero IRQ handlers. Zero FIFO. Pure PIO hardware.
+ *
+ * v2.5.1 fix (over v2.5.0):
+ *   - _toneStart() opens every tone on the gate's ON half (stops SM2,
+ *     restarts its clock divider, jumps it to instruction [2]).
  *
  * v2.5.0 fixes (over v2.4.0):
  *   - begin() protected by critical section (multi-core safety).
