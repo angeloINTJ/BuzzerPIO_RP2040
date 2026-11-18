@@ -1,7 +1,7 @@
 /**
  * @file    BuzzerPIO_RP2040.h
  * @brief   Ultrasonic PWM tone generation using dual PIO state machines.
- * @version 2.5.0
+ * @version 2.5.1
  * @license MIT
  *
  * @details
@@ -44,6 +44,27 @@
  *   a pico-sdk `critical_section_t`, which uses a hardware spinlock
  *   and disables interrupts on the calling core — correct for both
  *   single-core and dual-core RP2040 usage.
+ *
+ * @par Changelog (v2.5.1)
+ *   - Every tone opens on the ON half of its gate cycle. A note change
+ *     restarted SM2 with pio_sm_restart() alone, which keeps the program
+ *     counter, so the new note resumed the old note's cycle wherever it
+ *     stood: it could open on its OFF half, up to half a period late,
+ *     and a change just after an ON edge left a click of a few carrier
+ *     pulses before a whole OFF half. _toneStart() now stops SM2,
+ *     restarts its clock divider and jumps it to the ON instruction, so
+ *     a tone opens one gate tick (1/64 of its period) after the gate is
+ *     enabled, which comes the caller's latency after the call or the
+ *     alarm. Measured on a Pico W, its buzzer pin captured pulse by pulse
+ *     (2026-11-18): a 400 -> 250 Hz change after exactly 60 cycles
+ *     opened off-phase in 10 of 12 plays, and an 880 -> 1100 -> 1320 Hz
+ *     melody started half a period late in 12 of 12. After the fix, each
+ *     of the 36 note changes in those 24 plays opened within 0.06 ms of
+ *     its written time, counted from the melody's first ON edge.
+ *   - tone() called again restarts the tone on its ON half. Calls closer
+ *     than half a period (tone() on every loop() pass) now keep the gate
+ *     ON, which is silent; v2.5.0 advanced half a cycle per call instead,
+ *     which sounds at the wrong pitch. Call tone() when the pitch changes.
  *
  * @par Changelog (v2.5.0)
  *   - begin() and end() now fully protected by critical section,
@@ -217,6 +238,12 @@ public:
     bool isReady() const { return _ready; }
 
     // ── Tone ────────────────────────────────────────────────────────────
+    /**
+     * @brief  Play a continuous tone; 0 Hz or volume 0 is silence.
+     * @note   Each call restarts the tone on the ON half of its cycle.
+     *         Call it when the pitch changes, not on every loop() pass:
+     *         calls closer than half a period keep the gate ON (silent).
+     */
     void tone(uint32_t freqHz);
     void tone(uint32_t freqHz, uint16_t durationMs);
     void noTone();
