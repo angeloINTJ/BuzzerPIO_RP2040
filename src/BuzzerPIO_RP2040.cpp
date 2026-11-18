@@ -869,6 +869,17 @@ int64_t BuzzerPIO::_melodyCallback(alarm_id_t id, void* user) {
  * @brief  Start a tone: set SM2 clock divider and enable gate.
  *         SM1 (PWM) runs continuously — only SM2 is started/stopped.
  *
+ * v2.5.1: Every tone opens on the gate's ON half, one gate tick (1/64
+ *         of its period) after the gate is enabled below. SM2 is stopped,
+ *         its clock divider restarted, and its program counter jumped to
+ *         the ON instruction before it runs again. Until v2.5.0,
+ *         pio_sm_restart() alone did the restart, and SM_RESTART clears
+ *         the delay counter but keeps the program counter: a new note
+ *         resumed the old note's cycle wherever it stood. It could open on
+ *         its OFF half, up to half a period late, and a note change landing
+ *         just after an ON edge left a burst of a few carrier pulses (a
+ *         click) followed by a whole OFF half.
+ *
  * v2.4: Added _ready guard to prevent access to deallocated PIO
  *        resources if called after end(). Symmetric with _toneStop().
  *
@@ -888,9 +899,17 @@ void BuzzerPIO::_toneStart(uint32_t freqHz) {
         pio_sm_set_enabled(_pio, _smPwm, true);
     }
 
-    // Set SM2 frequency and start gate
+    // Stop SM2 where it stands. OE keeps its level until SM2 runs
+    // again below.
+    pio_sm_set_enabled(_pio, _smGate, false);
+
+    // New frequency, counted from a known divider phase
     _setFreq(freqHz);
     pio_sm_restart(_pio, _smGate);
+    pio_sm_clkdiv_restart(_pio, _smGate);
+
+    // Open on the ON half: instruction [2], `set pindirs, 1 [31]`
+    pio_sm_exec(_pio, _smGate, pio_encode_jmp(_offset + 2));
     pio_sm_set_enabled(_pio, _smGate, true);
 }
 
