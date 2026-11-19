@@ -296,7 +296,7 @@ The enable bits of a block's four state machines live in one register, `CTRL`, a
 
 Up to v2.5.1 BuzzerPIO switched its enable bits at note boundaries, from the note's alarm, and that is what another driver of the block undid: the note stopped after one burst or none. Since v2.5.2 the two state machines are enabled in `begin()`, through the register's atomic set alias, and after that nothing reads `CTRL` or clears the enable bits. A tone is switched by the pin's mux, and each note's start writes the two bits again, which changes nothing unless something else had cleared them.
 
-Measured on a Pico W whose `pio1` also runs the CYW43 radio's SPI and a DHT22 (2026-11-18), with a looping 80 ms beep: v2.5.1 lost 6 beeps of 3,420, each with both enable bits found cleared at its end; v2.5.2 lost none of 9,149 in the same test. (Two beeps of the v2.5.2 run were read as twice their length; the cause was not established, and the header's changelog says what was checked.)
+Measured on a Pico W whose `pio1` also runs the CYW43 radio's SPI and a DHT22 (2026-11-18), with a looping 80 ms beep: v2.5.1 lost 6 beeps of 3,420, each with both enable bits found cleared at its end; v2.5.2 lost none of 9,149 in the same test. (The irregular beeps of the v2.5.2 run were flash erases on the test firmware and losses of the board that read the pin, not the library: the header's changelog says how they were told apart.)
 
 A driver of your own that enables and disables a state machine from more than one context can lose its change the same way: `hw_set_bits(&pio->ctrl, 1u << sm)` and `hw_clear_bits(&pio->ctrl, 1u << sm)` are single writes.
 

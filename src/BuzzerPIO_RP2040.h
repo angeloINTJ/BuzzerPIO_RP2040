@@ -76,12 +76,15 @@
  *     v2.5.2 lost none in the same test: the counter stayed at 0 over
  *     9,149 notes (8,393 under the same traffic, 756 with the network
  *     quiet), and none was missing among the 9,010 of them that fell
- *     inside the second board's listening windows. Two of those 9,010
- *     were read as twice their length, with the beat one note late
- *     after each: the Pico W's own counts of notes started in those two
- *     windows are those of every other window, and 4,606 more note
- *     starts timed inside the library showed no late one. The cause
- *     was not established.
+ *     inside the second board's listening windows. None of the
+ *     irregular ones is the library's (read again on 2026-11-19). Five
+ *     note boundaries ran 13 to 48 ms late, each in a window where the
+ *     firmware erased flash, which keeps the interrupts off for up to
+ *     about 50 ms: that note ran long, the next one short by as much,
+ *     and the beat kept its time. Two beeps read as 159 ms, with no
+ *     pause between them and the beat 80 ms off after each: every note
+ *     is scheduled from the previous note's due time, so the board
+ *     cannot move the beat, and the second board lost those 80 ms.
  *   - SM2 is re-phased without its enable bit: its clock divider is
  *     parked at 65,535 and restarted, its delay counter cleared and its
  *     program counter forced to the ON instruction while it stands
