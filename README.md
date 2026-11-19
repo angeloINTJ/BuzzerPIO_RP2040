@@ -53,7 +53,9 @@ Result: output = SM1_pwm AND SM2_gate
 
 4. **Volume** — Patching SM1's instruction delays changes the PWM duty cycle from 3% (barely audible) to 97% (maximum). v2.5 uses a quadratic mapping curve so that perceived loudness increases evenly across the 0–100 range (matching human hearing's logarithmic response). The carrier frequency stays constant at ~95 kHz regardless of volume — no harmonic distortion, no frequency shift.
 
-5. **Melody sequencing** — Hardware alarm chain (same proven mechanism as v1.0). Each note transition stops SM2, sets its clock divider for the new frequency and restarts it on the ON half of its cycle, so every note opens one gate tick (1/64 of its period), plus the callback's latency, after its alarm fires. All note transitions happen with < 10 µs jitter, completely independent of the main loop. (Up to v2.5.0 a note could open on its OFF half, up to half a period late; v2.5.1 fixed it.)
+5. **Melody sequencing** — Hardware alarm chain (same proven mechanism as v1.0). Each note transition holds SM2 still by parking its clock divider, puts it on the ON half of its cycle and restarts it at the new frequency, so every note opens within one gate tick (1/64 of its period), plus the callback's latency, of its alarm. Note transitions are timed by the alarm, independent of the main loop. (Up to v2.5.0 a note could open on its OFF half, up to half a period late; v2.5.1 fixed it.)
+
+6. **Silence** — Whenever no tone sounds the pin leaves the PIO: it is muxed to SIO and driven LOW, while both state machines keep running. They are enabled in `begin()` and never stopped until `end()` (v2.5.2; see [the shared CTRL register](#the-blocks-ctrl-register-is-shared)).
 
 ## Installation
 
@@ -148,7 +150,7 @@ v2.5 uses a **quadratic mapping curve** for perceptually linear volume steps. Th
 | 100% | 97% | ~95 kHz | Maximum amplitude |
 | 50% | ~25% | ~95 kHz | Perceptually "half" |
 | 10% | ~3% | ~95 kHz | Very quiet |
-| 0% | — | — | Silent (gate disabled) |
+| 0% | — | — | Silent (pin driven LOW) |
 
 The carrier frequency is **constant** regardless of volume — no harmonic distortion.
 
@@ -287,6 +289,16 @@ The dual-SM architecture was specifically designed to fit alongside other PIO-in
 | pio1 | **BuzzerPIO** (if auto-probed here) | 4/32 | 2/4 |
 
 Both blocks have room for BuzzerPIO (4 instructions + 2 SMs). The auto-probe tries the preferred block first, then falls back. If neither block has enough resources, `begin()` returns `false`.
+
+### The block's CTRL register is shared
+
+The enable bits of a block's four state machines live in one register, `CTRL`, and `pio_sm_set_enabled()` reads it, changes one bit and writes it back. A driver interrupted between its read and its write by another driver's change writes that change away.
+
+Up to v2.5.1 BuzzerPIO switched its enable bits at note boundaries, from the note's alarm, and that is what another driver of the block undid: the note stopped after one burst or none. Since v2.5.2 the two state machines are enabled in `begin()`, through the register's atomic set alias, and after that nothing reads `CTRL` or clears the enable bits. A tone is switched by the pin's mux, and each note's start writes the two bits again, which changes nothing unless something else had cleared them.
+
+Measured on a Pico W whose `pio1` also runs the CYW43 radio's SPI and a DHT22 (2026-11-18), with a looping 80 ms beep: v2.5.1 lost 6 beeps of 3,420, each with both enable bits found cleared at its end; v2.5.2 lost none of 9,149 in the same test. (Two beeps of the v2.5.2 run were read as twice their length; the cause was not established, and the header's changelog says what was checked.)
+
+A driver of your own that enables and disables a state machine from more than one context can lose its change the same way: `hw_set_bits(&pio->ctrl, 1u << sm)` and `hw_clear_bits(&pio->ctrl, 1u << sm)` are single writes.
 
 ## Migration from v1.x / v2.x
 
