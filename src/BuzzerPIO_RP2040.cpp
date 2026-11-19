@@ -1,7 +1,7 @@
 /**
  * @file    BuzzerPIO_RP2040.cpp
  * @brief   BuzzerPIO v2.5 — Dual-SM AND gate: ultrasonic PWM × tone gate.
- * @version 2.5.1
+ * @version 2.5.2
  * @license MIT
  *
  * SM1 (2 instr): ultrasonic PWM via `set pins` → controls GPIO value.
@@ -10,6 +10,15 @@
  * With GPIO pull-down: output = SM1_pwm AND SM2_gate.
  *
  * Zero DMA. Zero IRQ handlers. Zero FIFO. Pure PIO hardware.
+ *
+ * v2.5.2 fix (over v2.5.1):
+ *   - Both state machines are enabled in begin() and run until end().
+ *     After begin() nothing reads CTRL or clears SM_ENABLE: a tone is
+ *     switched by the pin's mux, and SM2 is re-phased with its clock
+ *     divider parked instead of its enable bit cleared. Another driver
+ *     of the block, interrupted in its read-modify-write of CTRL by a
+ *     note's alarm, could switch the note off (BuzzerPIO_RP2040.h has
+ *     the measurement).
  *
  * v2.5.1 fix (over v2.5.0):
  *   - _toneStart() opens every tone on the gate's ON half (stops SM2,
@@ -217,8 +226,11 @@ bool BuzzerPIO::_tryAllocPio(PIO pio) {
 }
 
 void BuzzerPIO::_freePio() {
-    pio_sm_set_enabled(_pio, _smPwm, false);
-    pio_sm_set_enabled(_pio, _smGate, false);
+    // Atomic clear alias: no read-modify-write of the block's CTRL
+    hw_clear_bits(&_pio->ctrl, (1u << _smPwm) | (1u << _smGate));
+    // SM2's output enable back to 0, as begin() found it (a forced
+    // instruction runs on a stopped state machine)
+    pio_sm_exec(_pio, _smGate, pio_encode_set(pio_pindirs, 0));
     pio_sm_unclaim(_pio, _smPwm);
     pio_sm_unclaim(_pio, _smGate);
     pio_remove_program(_pio, &_program, _offset);
@@ -298,18 +310,27 @@ bool BuzzerPIO::begin() {
         // SM2 will control OE via `set pindirs` instructions.
     }
 
-    // ── 4. GPIO: mux to PIO + enable pull-down ───────────────────────
-    //   Pull-down ensures pin = LOW when OE=0 (gate closed).
-    pio_gpio_init(_pio, _pin);
+    // ── 4. GPIO: silent — on SIO, driven LOW, pull-down kept ─────────
+    //   The pin is muxed to the PIO only while a tone sounds.
     gpio_pull_down(_pin);
+    _stopIrqSafe();
 
     // ── 5. Apply default volume (patches SM1 instruction delays) ─────
     _setDuty();
 
-    // ── 6. Start SM1 (PWM runs continuously — inaudible without gate)
-    pio_sm_set_enabled(_pio, _smPwm, true);
-
-    // SM2 stays disabled until tone() or playMelody() is called.
+    // ── 6. Start both SMs with the atomic set alias ──────────────────
+    //   v2.5.2: they run from here to end(), and nothing after this
+    //   reads CTRL or clears their SM_ENABLE bits; a tone is switched by
+    //   the pin's mux. The enable bits of a block's four state machines
+    //   share its CTRL register, and pio_sm_set_enabled() reads,
+    //   modifies and writes it. Up to v2.5.1 this library switched
+    //   SM_ENABLE at note boundaries, and another driver of the block
+    //   (on a Pico W: the radio's SPI, a DHT22) interrupted between its
+    //   read and its write by a note's alarm wrote the old enables back:
+    //   the note that had just started was switched off. 6 beeps of
+    //   3,420 on a Pico W, each with both bits found cleared at its end
+    //   (2026-11-18; the header's changelog has the test).
+    hw_set_bits(&_pio->ctrl, (1u << _smPwm) | (1u << _smGate));
 
     _ready = true;
     critical_section_exit(&_lock);
@@ -347,8 +368,7 @@ void BuzzerPIO::end() {
     // Inline the SM stop operations here instead of calling _toneStop(),
     // because _toneStop() has an `if (!_ready) return` guard that would
     // skip the stop if we set _ready=false first.
-    pio_sm_set_enabled(_pio, _smGate, false);
-    pio_sm_exec(_pio, _smGate, pio_encode_set(pio_pindirs, 0));
+    _stopIrqSafe();
 
     // NOW mark as not ready — prevents any new PIO access from other cores
     _ready   = false;
@@ -516,7 +536,7 @@ int64_t BuzzerPIO::_timedToneCallback(alarm_id_t id, void* user) {
  * _setDuty() PIO patch are now atomic — a melody callback cannot
  * observe _volume mid-change or see a partially patched instruction.
  *
- * @param  volume  0 = mute (gate disabled), 100 = max duty cycle.
+ * @param  volume  0 = mute (pin off the PIO, driven LOW), 100 = max duty cycle.
  *                 Values > 100 are clamped to 100.
  */
 void BuzzerPIO::setVolume(uint8_t volume) {
@@ -538,7 +558,7 @@ void BuzzerPIO::setVolume(uint8_t volume) {
  *   Volume 100 → dH=31, dL=0  → duty 97% (period=33).
  *   Volume  50 → dH=7,  dL=24 → duty 25% (period=33).   [quadratic]
  *   Volume   1 → dH=0,  dL=31 → duty  3% (period=33).
- *   Volume   0 → SM2 disabled (silence via gate).
+ *   Volume   0 → pin off the PIO, driven LOW (silence).
  *
  *   v2.5: Quadratic curve — dH = ((vol-1)² × 31) / 99².
  *   This maps volume 50 → dH≈7 instead of the linear dH≈15, giving
@@ -550,19 +570,16 @@ void BuzzerPIO::setVolume(uint8_t volume) {
  *   At CLKDIV=40: carrier ≈ 94.7 kHz (constant, ultrasonic).
  *
  *   Design note on direct instr_mem patching:
- *   SM1 is briefly disabled (~2 PIO cycles) during the patch to prevent
- *   reading a half-written instruction. Since the carrier is ultrasonic
- *   (~95 kHz), the pause is <25 µs — imperceptible to human hearing.
- *   An alternative double-buffer approach (write to spare instruction
- *   slots, then re-wrap) would eliminate even this micro-pause, but was
- *   deemed unnecessary given the sub-microsecond actual gap and the
- *   additional complexity of managing spare instruction memory.
+ *   SM1 keeps running while its two instructions are patched (v2.5.2;
+ *   until v2.5.1 it was stopped around the patch, which read, modified
+ *   and wrote the block's CTRL). Each instruction is one register write,
+ *   so SM1 never reads a half-written one; it may run one carrier period
+ *   (about 10 µs) on one new and one old delay, far above hearing.
  */
 void BuzzerPIO::_setDuty() {
     if (_volume == 0) {
-        // Mute: disable gate SM → OE=0 → pin pulled LOW via pull-down
-        pio_sm_set_enabled(_pio, _smGate, false);
-        pio_sm_exec(_pio, _smGate, pio_encode_set(pio_pindirs, 0));
+        // Mute: pin off the PIO, driven LOW
+        _stopIrqSafe();
         return;
     }
 
@@ -580,16 +597,10 @@ void BuzzerPIO::_setDuty() {
     uint16_t instr0 = 0xE001 | ((uint16_t)dH << 8);
     uint16_t instr1 = 0xE000 | ((uint16_t)dL << 8);
 
-    // Patch SM1 instruction memory (briefly disable to avoid glitch)
-    bool wasEnabled = _pio->ctrl & (1u << _smPwm);
-    pio_sm_set_enabled(_pio, _smPwm, false);
-
+    // Patch SM1 instruction memory while it runs (see the design note
+    // above): two register writes, no CTRL access.
     _pio->instr_mem[_offset + 0] = instr0;
     _pio->instr_mem[_offset + 1] = instr1;
-
-    if (wasEnabled) {
-        pio_sm_set_enabled(_pio, _smPwm, true);
-    }
 }
 
 
@@ -849,9 +860,8 @@ int64_t BuzzerPIO::_melodyCallback(alarm_id_t id, void* user) {
     const BuzzerNote& note = melody[nextIdx];
 
     if (note.freqHz > 0 && self->_volume > 0) {
-        // _toneStart re-enables SM1 (PWM) if it was disabled by a
-        // preceding silent note's _stopIrqSafe(), and re-muxes GPIO
-        // back to PIO function. Critical for melody loop continuity.
+        // _toneStart re-phases the gate and muxes the GPIO back to the
+        // PIO after a silent note's _stopIrqSafe().
         self->_toneStart(note.freqHz);
     } else {
         self->_stopIrqSafe();
@@ -870,13 +880,43 @@ int64_t BuzzerPIO::_melodyCallback(alarm_id_t id, void* user) {
 // =========================================================================
 
 /**
- * @brief  Start a tone: set SM2 clock divider and enable gate.
- *         SM1 (PWM) runs continuously — only SM2 is started/stopped.
+ * @brief  Start a tone: re-phase SM2 on its ON half at the tone's
+ *         frequency and mux the pin to the PIO. Both SMs stay enabled.
  *
- * v2.5.1: Every tone opens on the gate's ON half, one gate tick (1/64
- *         of its period) after the gate is enabled below. SM2 is stopped,
- *         its clock divider restarted, and its program counter jumped to
- *         the ON instruction before it runs again. Until v2.5.0,
+ * v2.5.2: SM_ENABLE is not cleared here any more (see begin()). Up to
+ *         v2.5.1 SM2 was stopped while its divider, delay counter and
+ *         program counter were rewritten. It is now held still without
+ *         its enable bit, by its own clock divider:
+ *           1. the divider is set to 65,535 and restarted: SM2 gets no
+ *              tick for 65,535 system clocks (0.49 ms at 133 MHz),
+ *              except one the restart itself may produce at once, which
+ *              the two register reads that follow are there to let pass;
+ *           2. SM_RESTART clears SM2's delay counter and a forced jump
+ *              puts its program counter on the ON instruction ([2],
+ *              `set pindirs, 1 [31]`), with SM2 at rest;
+ *           3. the tone's divider is written and restarted from phase 0:
+ *              SM2 runs [2] at its first tick. The divider's arithmetic
+ *              (two 64-bit divisions) runs inside the held window; were
+ *              it ever to outlast it, SM2 would run [2] at the parked
+ *              divider's tick, and the tone would still open ON.
+ *         What the steps rely on: a write to SMx_INSTR runs at once on
+ *         a state machine that is waiting for its next tick (as
+ *         pio_sm_init() relies on for a stopped one), and a tick that
+ *         the divider's restart itself produces, if it produces one,
+ *         comes within the two reads (a handful of system clocks). They
+ *         do not rely on whether the first tick after a restart comes at
+ *         once or one period later, on what a forced instruction does to
+ *         a state machine inside a delay, or on SM_RESTART keeping the
+ *         program counter: the register descriptions leave those open.
+ *         Measured on an RP2040 only (the header's changelog).
+ *         The callers hold the lock, so nothing on this core runs in
+ *         between. The same last write sets the two SM_ENABLE bits
+ *         again, through the set alias: the value they already have,
+ *         unless something else cleared them, and then this note brings
+ *         the buzzer back.
+ *
+ * v2.5.1: Every tone opens on the gate's ON half, within one gate tick
+ *         (1/64 of its period) of this call. Until v2.5.0,
  *         pio_sm_restart() alone did the restart, and SM_RESTART clears
  *         the delay counter but keeps the program counter: a new note
  *         resumed the old note's cycle wherever it stood. It could open on
@@ -893,51 +933,46 @@ int64_t BuzzerPIO::_melodyCallback(alarm_id_t id, void* user) {
 void BuzzerPIO::_toneStart(uint32_t freqHz) {
     if (!_ready) return;
 
-    // Ensure GPIO is muxed to PIO (may have been switched to SIO by
-    // _stopIrqSafe during a silent note in a melody)
-    pio_gpio_init(_pio, _pin);
+    const uint32_t clkdivRestart = 1u << (PIO_CTRL_CLKDIV_RESTART_LSB + _smGate);
 
-    // Ensure SM1 (PWM) is running
-    if (!(_pio->ctrl & (1u << _smPwm))) {
-        pio_sm_restart(_pio, _smPwm);
-        pio_sm_set_enabled(_pio, _smPwm, true);
-    }
+    // 1. Hold SM2 still: divider at 65,535, restarted; then two reads of
+    //    its (read-only) address register, a few clocks for a tick the
+    //    restart itself may produce to pass before SM2's state is rewritten.
+    pio_sm_set_clkdiv_int_frac(_pio, _smGate, 65535, 0);
+    hw_set_bits(&_pio->ctrl, clkdivRestart);
+    (void)_pio->sm[_smGate].addr;
+    (void)_pio->sm[_smGate].addr;
 
-    // Stop SM2 where it stands. OE keeps its level until SM2 runs
-    // again below.
-    pio_sm_set_enabled(_pio, _smGate, false);
-
-    // New frequency, counted from a known divider phase
-    _setFreq(freqHz);
-    pio_sm_restart(_pio, _smGate);
-    pio_sm_clkdiv_restart(_pio, _smGate);
-
-    // Open on the ON half: instruction [2], `set pindirs, 1 [31]`
+    // 2. At rest: no delay pending, program counter on the ON instruction
+    hw_set_bits(&_pio->ctrl, 1u << (PIO_CTRL_SM_RESTART_LSB + _smGate));
     pio_sm_exec(_pio, _smGate, pio_encode_jmp(_offset + 2));
-    pio_sm_set_enabled(_pio, _smGate, true);
+
+    // 3. The tone's divider, from phase 0; the enables, written again
+    _setFreq(freqHz);
+    hw_set_bits(&_pio->ctrl, clkdivRestart | (1u << _smPwm) | (1u << _smGate));
+
+    // The pin goes (back) to the PIO last: until here it was on SIO,
+    // driven LOW, if the buzzer was silent.
+    pio_gpio_init(_pio, _pin);
 }
 
 /**
- * @brief  Stop tone: disable SM2 gate, force OE=0.
- *         SM1 (PWM) keeps running (inaudible without gate).
+ * @brief  Stop tone: take the pin off the PIO and drive it LOW.
+ *         Both SMs keep running (inaudible off the pin).
  */
 void BuzzerPIO::_toneStop() {
     if (!_ready) return;
 
-    pio_sm_set_enabled(_pio, _smGate, false);
-    // Force OE=0 so pin goes to pull-down (LOW)
-    pio_sm_exec(_pio, _smGate, pio_encode_set(pio_pindirs, 0));
+    _stopIrqSafe();
 }
 
 /**
- * @brief  IRQ-safe stop — disable both SMs, switch GPIO to SIO, force LOW.
- *         Only register writes — safe from alarm callbacks.
+ * @brief  IRQ-safe stop — switch GPIO to SIO, force LOW.
+ *         Only per-pin register writes — safe from alarm callbacks.
+ *
+ * v2.5.2: the state machines are left running (see begin()).
  */
 void BuzzerPIO::_stopIrqSafe() {
-    pio_sm_set_enabled(_pio, _smGate, false);
-    pio_sm_set_enabled(_pio, _smPwm, false);
-
-    // Switch GPIO to SIO and force LOW to avoid floating pin
     gpio_set_function(_pin, GPIO_FUNC_SIO);
     sio_hw->gpio_oe_set = (1u << _pin);
     sio_hw->gpio_clr    = (1u << _pin);
