@@ -1,7 +1,7 @@
 /**
  * @file    BuzzerPIO_RP2040.h
  * @brief   Ultrasonic PWM tone generation using dual PIO state machines.
- * @version 2.5.1
+ * @version 2.5.2
  * @license MIT
  *
  * @details
@@ -21,6 +21,9 @@
  *   With GPIO pull-down enabled:
  *     OE=1 → pin outputs SM1 PWM (buzzer hears ultrasonic carrier)
  *     OE=0 → pin hi-Z → pulled LOW (silence)
+ *
+ *   Between tones the pin is off the PIO, on SIO and driven LOW; both
+ *   state machines keep running (v2.5.2).
  *
  *   **Result: output = SM1_pwm AND SM2_gate** — amplitude-modulated tone.
  *
@@ -44,6 +47,65 @@
  *   a pico-sdk `critical_section_t`, which uses a hardware spinlock
  *   and disables interrupts on the calling core — correct for both
  *   single-core and dual-core RP2040 usage.
+ *
+ * @par Changelog (v2.5.2)
+ *   - A note is no longer switched off by another driver of the same
+ *     PIO block. The four SM_ENABLE bits of a block share its CTRL
+ *     register, and pio_sm_set_enabled() reads CTRL, changes one bit and
+ *     writes it back. Up to v2.5.1 this library switched SM_ENABLE at
+ *     note boundaries: SM2 was enabled at every note's start, and both
+ *     state machines were disabled in a melody's rests and at its end.
+ *     A driver interrupted by a note's alarm between its read and its
+ *     write then wrote the old value back, with this library's bits
+ *     cleared: the note that had just started stopped after one burst
+ *     or none, its pin frozen HIGH or LOW until the next note. Both
+ *     state machines are now enabled in begin(), through CTRL's atomic
+ *     set alias, and run until end(). After begin() returns, nothing
+ *     here reads CTRL or clears SM_ENABLE, so an old value written back
+ *     is the value already there; each note's start writes the two bits
+ *     again through the same alias, which changes nothing unless they
+ *     had been cleared. A tone is switched by the pin's mux instead: on
+ *     the PIO while it sounds, on SIO and driven LOW when it is silent.
+ *     Measured on a Pico W (2026-11-18) whose pio1 also runs the CYW43
+ *     radio's SPI and a DHT22, with a looping beep of 2200 Hz, 80 ms on
+ *     and 80 ms off, heard by a second board on the buzzer pin. v2.5.1
+ *     lost 6 beeps of 3,420: 5 of 2,854 with the radio receiving 500
+ *     UDP datagrams a second and 1 of 566 with the network quiet. A
+ *     counter in the note's alarm found both SM_ENABLE bits cleared at
+ *     the end of each of the six, and of no other note.
+ *     v2.5.2 lost none in the same test: the counter stayed at 0 over
+ *     9,149 notes (8,393 under the same traffic, 756 with the network
+ *     quiet), and none was missing among the 9,010 of them that fell
+ *     inside the second board's listening windows. Two of those 9,010
+ *     were read as twice their length, with the beat one note late
+ *     after each: the Pico W's own counts of notes started in those two
+ *     windows are those of every other window, and 4,606 more note
+ *     starts timed inside the library showed no late one. The cause
+ *     was not established.
+ *   - SM2 is re-phased without its enable bit: its clock divider is
+ *     parked at 65,535 and restarted, its delay counter cleared and its
+ *     program counter forced to the ON instruction while it stands
+ *     still, and the tone's divider restarted from phase 0. A tone
+ *     opens on its ON half within one gate tick (1/64 of its period) of
+ *     that last restart, which ends the call.
+ *     Measured on the same board, the pin captured pulse by pulse: 34
+ *     note changes of two melodies (400 -> 250 Hz and 880 -> 1100 ->
+ *     1320 Hz) opened -0.002 to +0.059 ms from their written time, as
+ *     in v2.5.1, and 21 of 21 beeps that follow a pause opened on a
+ *     whole ON half (219 to 226 us; the half period is 227 us).
+ *   - Whenever no tone sounds, from begin() on, the pin is an SIO
+ *     output driven LOW: after begin(), noTone(), stopMelody(),
+ *     pauseMelody(), a timed tone's end, a melody's rests and end, and
+ *     at volume 0. Up to v2.5.1 that was so only in a melody's rests
+ *     and at its end and a timed tone's; elsewhere the pin stayed on
+ *     the PIO with its output disabled, held LOW by the pull-down.
+ *   - Both state machines run from begin() to end(), in silence too.
+ *     Up to v2.5.1 both were stopped in a melody's rests, at its end
+ *     and at a timed tone's end. Their supply current was not measured.
+ *   - setVolume() patches SM1's two instructions while SM1 runs; SM1
+ *     is no longer stopped around the patch.
+ *   - Measured on an RP2040 only. Not measured: an RP2350, and a
+ *     driver that shares the block from the other core.
  *
  * @par Changelog (v2.5.1)
  *   - Every tone opens on the ON half of its gate cycle. A note change
